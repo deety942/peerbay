@@ -8,6 +8,7 @@ peerBay is now hardened for internet deployment with strict production checks.
   - `ARCHIVE_ADMIN_TOKEN` for admin actions
   - `ARCHIVE_READ_TOKEN` for listing/downloads
   - `ARCHIVE_MESH_TOKEN` for peer mesh routes
+  - per-user read/mesh tokens via self-signup/login
 - Strict production startup validation (`--production` / `ARCHIVE_PRODUCTION=true`):
   - requires all tokens
   - requires `ARCHIVE_NODE_URL`
@@ -63,6 +64,7 @@ python3 archive_index.py --db ./archive_index.db serve \
 - `ARCHIVE_MESH_TOKEN`
 - `ARCHIVE_INDEX_SECRET`
 - `ARCHIVE_PRODUCTION`
+- `ARCHIVE_ALLOW_SIGNUP` (default true)
 
 ## Core routes
 
@@ -71,6 +73,8 @@ python3 archive_index.py --db ./archive_index.db serve \
 - `/api/profile`
 - `/api/entries`
 - `/api/browse?path=<relative-folder>`
+- `/api/signup`
+- `/api/login`
 - `/api/rescan`
 - `/api/peers`
 - `/api/announce`

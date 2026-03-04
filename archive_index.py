@@ -6,6 +6,7 @@ import hmac
 import json
 import mimetypes
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -46,6 +47,24 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+  username TEXT PRIMARY KEY,
+  password_salt TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_login_at TEXT
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+  token_hash TEXT PRIMARY KEY,
+  token_prefix TEXT NOT NULL,
+  role TEXT NOT NULL,
+  username TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT,
+  last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_role ON api_tokens(role);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username);
 """
 
 SIGN_FIELDS = [
@@ -280,6 +299,25 @@ INDEX_HTML = """<!doctype html>
         <button id="saveProfileBtn">Save Profile</button>
         <button id="rescanBtn">Rescan Folder</button>
       </div>
+      <hr style="border:0;border-top:1px solid rgba(200,208,214,.25);margin:12px 0;" />
+      <div class="panel-grid">
+        <div class="field">
+          <label for="authUsername">Signup/Login User</label>
+          <input id="authUsername" placeholder="newuser" />
+        </div>
+        <div class="field">
+          <label for="authPassword">Password</label>
+          <input id="authPassword" type="password" placeholder="at least 10 characters" />
+        </div>
+        <div class="field">
+          <label for="issuedToken">Issued Read Token</label>
+          <input id="issuedToken" readonly placeholder="generated after signup/login" />
+        </div>
+      </div>
+      <div class="actions">
+        <button id="signupBtn">Sign Up + Generate Tokens</button>
+        <button id="loginBtn">Login + Rotate Tokens</button>
+      </div>
       <p id="peerInfo" class="meta">Known peers: 0</p>
     </section>
 
@@ -310,6 +348,7 @@ INDEX_HTML = """<!doctype html>
     const rowsEl = document.getElementById("rows");
     const tokenEl = document.getElementById("accessToken");
     const pathLabelEl = document.getElementById("pathLabel");
+    const issuedTokenEl = document.getElementById("issuedToken");
     let currentBrowsePath = "";
     let currentMode = "browse";
 
@@ -337,6 +376,14 @@ INDEX_HTML = """<!doctype html>
 
     function saveToken() {
       localStorage.setItem("peerBayAccessToken", tokenValue());
+    }
+
+    function setIssuedTokens(data) {
+      if (!data || !data.read_token) return;
+      issuedTokenEl.value = data.read_token;
+      tokenEl.value = data.read_token;
+      saveToken();
+      setStatus("Token issued. Saved to Access Token field.");
     }
 
     function fmtBytes(n) {
@@ -535,6 +582,54 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    async function signupUser() {
+      const username = (document.getElementById("authUsername").value || "").trim();
+      const password = document.getElementById("authPassword").value || "";
+      if (username.length < 3 || password.length < 10) {
+        setStatus("Signup needs username (3+) and password (10+).", true);
+        return;
+      }
+      setStatus("Creating account...");
+      try {
+        const res = await fetch("/api/signup", {
+          method: "POST",
+          headers: authHeaders(true),
+          body: JSON.stringify({ username: username, password: password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Signup failed");
+        setIssuedTokens(data);
+        await loadPeers();
+        await loadBrowse(currentBrowsePath);
+      } catch (err) {
+        setStatus(String(err), true);
+      }
+    }
+
+    async function loginUser() {
+      const username = (document.getElementById("authUsername").value || "").trim();
+      const password = document.getElementById("authPassword").value || "";
+      if (!username || !password) {
+        setStatus("Login needs username and password.", true);
+        return;
+      }
+      setStatus("Logging in...");
+      try {
+        const res = await fetch("/api/login", {
+          method: "POST",
+          headers: authHeaders(true),
+          body: JSON.stringify({ username: username, password: password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Login failed");
+        setIssuedTokens(data);
+        await loadPeers();
+        await loadBrowse(currentBrowsePath);
+      } catch (err) {
+        setStatus(String(err), true);
+      }
+    }
+
     async function rescanFolder() {
       setStatus("Rescanning shared folder...");
       try {
@@ -572,6 +667,8 @@ INDEX_HTML = """<!doctype html>
     });
     document.getElementById("saveProfileBtn").addEventListener("click", saveProfile);
     document.getElementById("rescanBtn").addEventListener("click", rescanFolder);
+    document.getElementById("signupBtn").addEventListener("click", signupUser);
+    document.getElementById("loginBtn").addEventListener("click", loginUser);
     tokenEl.addEventListener("change", () => {
       saveToken();
       loadProfile();
@@ -702,6 +799,91 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+def hash_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def issue_api_token(conn: sqlite3.Connection, username: str, role: str) -> str:
+    raw = secrets.token_urlsafe(32)
+    conn.execute(
+        """
+        INSERT INTO api_tokens (token_hash, token_prefix, role, username, created_at, revoked_at, last_used_at)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL)
+        """,
+        (hash_token(raw), raw[:8], role, username, utc_now_iso()),
+    )
+    conn.commit()
+    return raw
+
+
+def revoke_user_tokens(conn: sqlite3.Connection, username: str) -> None:
+    conn.execute(
+        "UPDATE api_tokens SET revoked_at = ? WHERE username = ? AND revoked_at IS NULL",
+        (utc_now_iso(), username),
+    )
+    conn.commit()
+
+
+def lookup_api_token(conn: sqlite3.Connection, raw_token: str, role: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT token_hash, role, username FROM api_tokens
+        WHERE token_hash = ? AND role = ? AND revoked_at IS NULL
+        LIMIT 1
+        """,
+        (hash_token(raw_token), role),
+    ).fetchone()
+    if not row:
+        return None
+    conn.execute(
+        "UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?",
+        (utc_now_iso(), row["token_hash"]),
+    )
+    conn.commit()
+    return {"username": row["username"], "role": row["role"]}
+
+
+def hash_password(password: str, salt: str) -> str:
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200000)
+    return derived.hex()
+
+
+def create_user(conn: sqlite3.Connection, username: str, password: str) -> Dict[str, str]:
+    existing = conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        raise ValueError("username already exists")
+    salt = secrets.token_hex(16)
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO users (username, password_salt, password_hash, created_at, last_login_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (username, salt, hash_password(password, salt), now, now),
+    )
+    read_token = issue_api_token(conn, username, "read")
+    mesh_token = issue_api_token(conn, username, "mesh")
+    return {"read_token": read_token, "mesh_token": mesh_token}
+
+
+def login_user_and_rotate_tokens(conn: sqlite3.Connection, username: str, password: str) -> Dict[str, str]:
+    row = conn.execute(
+        "SELECT username, password_salt, password_hash FROM users WHERE username = ?",
+        (username,),
+    ).fetchone()
+    if not row:
+        raise ValueError("invalid credentials")
+    expected = hash_password(password, row["password_salt"])
+    if not hmac.compare_digest(expected, row["password_hash"]):
+        raise ValueError("invalid credentials")
+    revoke_user_tokens(conn, username)
+    read_token = issue_api_token(conn, username, "read")
+    mesh_token = issue_api_token(conn, username, "mesh")
+    conn.execute("UPDATE users SET last_login_at = ? WHERE username = ?", (utc_now_iso(), username))
+    conn.commit()
+    return {"read_token": read_token, "mesh_token": mesh_token}
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -1372,20 +1554,37 @@ class ArchiveHandler(BaseHTTPRequestHandler):
 
     def _require_read(self) -> bool:
         read_token = self.state.get("read_token")
-        if not read_token:
-            return True
         token = self._token_from_request()
-        if token and token in {read_token, self.state.get("admin_token")}:
+        admin_token = self.state.get("admin_token")
+        if token and token in {read_token, admin_token}:
+            return True
+        if token:
+            conn = ensure_db(self.db_path)
+            try:
+                hit = lookup_api_token(conn, token, "read")
+            finally:
+                conn.close()
+            if hit:
+                return True
+        if not read_token:
             return True
         self._send_json({"error": "unauthorized"}, status=401)
         return False
 
     def _require_mesh(self) -> bool:
         mesh_token = self.state.get("mesh_token")
-        if not mesh_token:
-            return True
         token = self.headers.get("X-Mesh-Token", "").strip()
         if token and token == mesh_token:
+            return True
+        if token:
+            conn = ensure_db(self.db_path)
+            try:
+                hit = lookup_api_token(conn, token, "mesh")
+            finally:
+                conn.close()
+            if hit:
+                return True
+        if not mesh_token:
             return True
         self._send_json({"error": "mesh unauthorized"}, status=401)
         return False
@@ -1426,6 +1625,7 @@ class ArchiveHandler(BaseHTTPRequestHandler):
                     "shared_dir": str(self.state.get("shared_dir")) if self.state.get("shared_dir") else None,
                     "node_url": self.state.get("node_url"),
                     "production": bool(self.state.get("production")),
+                    "allow_signup": bool(self.state.get("allow_signup")),
                 }
             )
             return
@@ -1537,6 +1737,64 @@ class ArchiveHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/signup":
+            if not self.state.get("allow_signup"):
+                self._send_json({"error": "signup disabled"}, status=403)
+                return
+            if self._rate_limited("signup", 15, 60):
+                return
+            try:
+                payload = self._read_json()
+                username = str(payload.get("username", "")).strip()
+                password = str(payload.get("password", ""))
+                if len(username) < 3:
+                    raise ValueError("username must be at least 3 chars")
+                if len(password) < 10:
+                    raise ValueError("password must be at least 10 chars")
+                conn = ensure_db(self.db_path)
+                try:
+                    tokens = create_user(conn, username, password)
+                finally:
+                    conn.close()
+                self._send_json(
+                    {
+                        "ok": True,
+                        "username": username,
+                        "read_token": tokens["read_token"],
+                        "mesh_token": tokens["mesh_token"],
+                    },
+                    status=201,
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/login":
+            if self._rate_limited("login", 30, 60):
+                return
+            try:
+                payload = self._read_json()
+                username = str(payload.get("username", "")).strip()
+                password = str(payload.get("password", ""))
+                if not username or not password:
+                    raise ValueError("username and password are required")
+                conn = ensure_db(self.db_path)
+                try:
+                    tokens = login_user_and_rotate_tokens(conn, username, password)
+                finally:
+                    conn.close()
+                self._send_json(
+                    {
+                        "ok": True,
+                        "username": username,
+                        "read_token": tokens["read_token"],
+                        "mesh_token": tokens["mesh_token"],
+                    }
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/add":
             if not self._require_admin():
                 return
@@ -1787,6 +2045,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         "read_token": args.read_token,
         "mesh_token": args.mesh_token,
         "production": bool(args.production),
+        "allow_signup": bool(args.allow_signup),
         "rate_limits": {},
     }
 
@@ -1826,6 +2085,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                     "mesh_token": bool(args.mesh_token),
                 },
                 "production": bool(args.production),
+                "allow_signup": bool(args.allow_signup),
             },
             indent=2,
         )
@@ -1967,6 +2227,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=is_true_env(os.getenv("ARCHIVE_PRODUCTION")),
         help="Enable strict production safety checks",
+    )
+    serve.add_argument(
+        "--allow-signup",
+        action=argparse.BooleanOptionalAction,
+        default=True if os.getenv("ARCHIVE_ALLOW_SIGNUP") is None else is_true_env(os.getenv("ARCHIVE_ALLOW_SIGNUP")),
+        help="Allow public self-signup to generate per-user tokens",
     )
     serve.set_defaults(func=cmd_serve)
 
