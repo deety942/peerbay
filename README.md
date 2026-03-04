@@ -155,6 +155,8 @@ Desktop app buttons:
 - `Start Peer Server` / `Stop Peer Server`
 - `Publish Availability`
 - `Download CID`
+- `Sign Up` / `Login`
+- `Browse Path` / `Search Files`
 
 User flow:
 
