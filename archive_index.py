@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_api_tokens_role ON api_tokens(role);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username);
+CREATE TABLE IF NOT EXISTS p2p_sources (
+  cid TEXT NOT NULL,
+  username TEXT NOT NULL,
+  peer_url TEXT NOT NULL,
+  file_name TEXT,
+  file_size INTEGER,
+  announced_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  PRIMARY KEY (cid, username, peer_url)
+);
+CREATE INDEX IF NOT EXISTS idx_p2p_sources_cid ON p2p_sources(cid);
 """
 
 SIGN_FIELDS = [
@@ -929,6 +940,55 @@ def login_user_and_rotate_tokens(conn: sqlite3.Connection, username: str, passwo
     return {"read_token": read_token, "mesh_token": mesh_token}
 
 
+def upsert_p2p_source(
+    conn: sqlite3.Connection,
+    *,
+    cid: str,
+    username: str,
+    peer_url: str,
+    file_name: Optional[str],
+    file_size: Optional[int],
+) -> None:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO p2p_sources (cid, username, peer_url, file_name, file_size, announced_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cid, username, peer_url) DO UPDATE SET
+          file_name=excluded.file_name,
+          file_size=excluded.file_size,
+          last_seen_at=excluded.last_seen_at
+        """,
+        (cid, username, peer_url, file_name, file_size, now, now),
+    )
+    conn.commit()
+
+
+def providers_for_cid(conn: sqlite3.Connection, cid: str, limit: int = 50) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT cid, username, peer_url, file_name, file_size, announced_at, last_seen_at
+        FROM p2p_sources
+        WHERE cid = ?
+        ORDER BY last_seen_at DESC
+        LIMIT ?
+        """,
+        (cid, max(1, min(limit, 200))),
+    ).fetchall()
+    return [
+        {
+            "cid": row["cid"],
+            "username": row["username"],
+            "peer_url": row["peer_url"],
+            "file_name": row["file_name"],
+            "file_size": row["file_size"],
+            "announced_at": row["announced_at"],
+            "last_seen_at": row["last_seen_at"],
+        }
+        for row in rows
+    ]
+
+
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -1729,6 +1789,21 @@ class ArchiveHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if parsed.path == "/api/p2p/providers":
+            if not self._require_read():
+                return
+            cid = (query.get("cid", [""])[0] or "").strip().lower()
+            if not cid:
+                self._send_json({"error": "cid is required"}, status=400)
+                return
+            conn = ensure_db(self.db_path)
+            try:
+                providers = providers_for_cid(conn, cid, limit=50)
+            finally:
+                conn.close()
+            self._send_json({"cid": cid, "providers": providers, "count": len(providers)})
+            return
+
         if parsed.path != "/entries":
             if parsed.path.startswith("/files/"):
                 if not self._require_read():
@@ -1795,6 +1870,43 @@ class ArchiveHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/p2p/publish":
+            if self._rate_limited("p2p_publish", 180, 60):
+                return
+            username = self._resolve_upload_username()
+            if not username:
+                self._send_json({"error": "unauthorized"}, status=401)
+                return
+            try:
+                payload = self._read_json()
+                peer_url = normalize_peer_url(str(payload.get("peer_url", "")).strip())
+                cid = str(payload.get("cid", "")).strip().lower()
+                if len(cid) < 16:
+                    raise ValueError("invalid cid")
+                file_name = payload.get("file_name")
+                file_size = payload.get("file_size")
+                if file_size is not None:
+                    file_size = int(file_size)
+                    if file_size < 0:
+                        raise ValueError("invalid file_size")
+
+                conn = ensure_db(self.db_path)
+                try:
+                    upsert_p2p_source(
+                        conn,
+                        cid=cid,
+                        username=username,
+                        peer_url=peer_url,
+                        file_name=file_name,
+                        file_size=file_size,
+                    )
+                finally:
+                    conn.close()
+                self._send_json({"ok": True, "cid": cid, "peer_url": peer_url, "username": username})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/upload":
             if self._rate_limited("upload", 120, 60):
                 return
