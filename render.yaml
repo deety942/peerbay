@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: p2p-archive-index
+    runtime: docker
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: archive-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ARCHIVE_INDEX_DB
+        value: /data/archive_index.db
+      - key: ARCHIVE_SHARED_DIR
+        value: /data/share
+      - key: ARCHIVE_PRODUCTION
+        value: "true"
+      - key: ARCHIVE_NODE_URL
+        sync: false
+      - key: ARCHIVE_INDEX_SECRET
+        generateValue: true
+      - key: ARCHIVE_ADMIN_TOKEN
+        generateValue: true
+      - key: ARCHIVE_READ_TOKEN
+        generateValue: true
+      - key: ARCHIVE_MESH_TOKEN
+        generateValue: true
