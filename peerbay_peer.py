@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -9,6 +10,11 @@ from typing import Any, Dict, List, Optional
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+
+
+def basic_auth_header(username: str, password: str) -> str:
+    raw = f"{username}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -151,7 +157,10 @@ def cmd_publish(args: argparse.Namespace) -> None:
         req = Request(
             f"{args.server.rstrip('/')}/api/p2p/publish",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {args.token}"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": basic_auth_header(args.username, args.password),
+            },
             method="POST",
         )
         with urlopen(req, timeout=args.timeout) as resp:
@@ -163,7 +172,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
 def cmd_download(args: argparse.Namespace) -> None:
     req = Request(
         f"{args.server.rstrip('/')}/api/p2p/providers?cid={args.cid}",
-        headers={"Authorization": f"Bearer {args.token}", "Accept": "application/json"},
+        headers={"Authorization": basic_auth_header(args.username, args.password), "Accept": "application/json"},
     )
     with urlopen(req, timeout=args.timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
@@ -221,13 +230,15 @@ def build_parser() -> argparse.ArgumentParser:
     publish = sub.add_parser("publish", help="Publish available files to peerBay index server")
     publish.add_argument("--server", required=True, help="peerBay server URL")
     publish.add_argument("--peer-url", required=True, help="Public URL of this peer service")
-    publish.add_argument("--token", required=True, help="User read token")
+    publish.add_argument("--username", required=True, help="Account username")
+    publish.add_argument("--password", required=True, help="Account password")
     publish.add_argument("--timeout", type=int, default=20)
     publish.set_defaults(func=cmd_publish)
 
     download = sub.add_parser("download", help="Download a CID directly from listed peers")
     download.add_argument("--server", required=True)
-    download.add_argument("--token", required=True, help="User read token")
+    download.add_argument("--username", required=True, help="Account username")
+    download.add_argument("--password", required=True, help="Account password")
     download.add_argument("--cid", required=True)
     download.add_argument("--dest-dir", default="./downloads")
     download.add_argument("--timeout", type=int, default=25)

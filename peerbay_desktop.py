@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import base64
 import json
 import queue
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -25,13 +28,13 @@ class PeerBayDesktop:
         self.root.geometry("980x760")
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.server_proc: subprocess.Popen[str] | None = None
+        self.tunnel_proc: subprocess.Popen[str] | None = None
 
         defaults = {
             "shared_dir": str(BASE_DIR / "shared"),
             "index": str(BASE_DIR / "peer_index.json"),
             "server": "https://p2p-archive-index.onrender.com",
             "peer_url": "http://127.0.0.1:9090",
-            "token": "",
             "auth_username": "",
             "auth_password": "",
             "browse_path": "",
@@ -58,29 +61,30 @@ class PeerBayDesktop:
         self._field(frame, 2, "Index File", "index", browse="file_save")
         self._field(frame, 3, "Index Server URL", "server")
         self._field(frame, 4, "Your Peer URL", "peer_url")
-        self._field(frame, 5, "Read Token", "token", secret=True)
-        self._field(frame, 6, "Peer Host", "host")
-        self._field(frame, 7, "Peer Port", "port")
-        self._field(frame, 8, "Account Username", "auth_username")
-        self._field(frame, 9, "Account Password", "auth_password", secret=True)
+        self._field(frame, 5, "Peer Host", "host")
+        self._field(frame, 6, "Peer Port", "port")
+        self._field(frame, 7, "Account Username", "auth_username")
+        self._field(frame, 8, "Account Password", "auth_password", secret=True)
 
         btns = ttk.Frame(frame)
-        btns.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(12, 6))
-        btns.columnconfigure((0, 1, 2, 3, 4), weight=1)
+        btns.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(12, 6))
+        btns.columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
 
         ttk.Button(btns, text="Save Config", command=self.save_config).grid(row=0, column=0, sticky="ew", padx=4)
         ttk.Button(btns, text="Scan Folder", command=self.scan_folder).grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(btns, text="Start Peer Server", command=self.start_server).grid(row=0, column=2, sticky="ew", padx=4)
         ttk.Button(btns, text="Stop Peer Server", command=self.stop_server).grid(row=0, column=3, sticky="ew", padx=4)
         ttk.Button(btns, text="Publish Availability", command=self.publish).grid(row=0, column=4, sticky="ew", padx=4)
+        ttk.Button(btns, text="Start Tunnel", command=self.start_tunnel).grid(row=0, column=5, sticky="ew", padx=4)
         ttk.Button(btns, text="Sign Up", command=self.signup).grid(row=1, column=1, sticky="ew", padx=4, pady=(6, 0))
         ttk.Button(btns, text="Login", command=self.login).grid(row=1, column=2, sticky="ew", padx=4, pady=(6, 0))
+        ttk.Button(btns, text="Stop Tunnel", command=self.stop_tunnel).grid(row=1, column=3, sticky="ew", padx=4, pady=(6, 0))
 
-        ttk.Separator(frame).grid(row=11, column=0, columnspan=4, sticky="ew", pady=8)
+        ttk.Separator(frame).grid(row=10, column=0, columnspan=4, sticky="ew", pady=8)
 
-        self._field(frame, 12, "Browse Path", "browse_path")
+        self._field(frame, 11, "Browse Path", "browse_path")
         browse_btns = ttk.Frame(frame)
-        browse_btns.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(0, 6))
+        browse_btns.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(0, 6))
         browse_btns.columnconfigure((0, 1), weight=1)
         ttk.Button(browse_btns, text="Browse Path", command=self.browse_path).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(browse_btns, text="Search Files", command=self.search_files).grid(row=0, column=1, sticky="ew", padx=(4, 0))
@@ -97,20 +101,20 @@ class PeerBayDesktop:
         self.browse_table.column("size", width=90, anchor="e")
         self.browse_table.column("user", width=120, anchor="w")
         self.browse_table.column("cid", width=320, anchor="w")
-        self.browse_table.grid(row=14, column=0, columnspan=4, sticky="nsew")
+        self.browse_table.grid(row=13, column=0, columnspan=4, sticky="nsew")
         self.browse_table.bind("<Double-1>", self._on_browse_double_click)
 
-        self._field(frame, 15, "Download CID", "download_cid")
-        self._field(frame, 16, "Download Folder", "download_dir", browse="dir")
+        self._field(frame, 14, "Download CID", "download_cid")
+        self._field(frame, 15, "Download Folder", "download_dir", browse="dir")
 
-        ttk.Button(frame, text="Download CID", command=self.download_cid).grid(row=17, column=0, columnspan=4, sticky="ew", pady=(6, 10))
+        ttk.Button(frame, text="Download CID", command=self.download_cid).grid(row=16, column=0, columnspan=4, sticky="ew", pady=(6, 10))
 
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(frame, textvariable=self.status_var).grid(row=18, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(frame, textvariable=self.status_var).grid(row=17, column=0, columnspan=4, sticky="w", pady=(0, 6))
 
         self.log = tk.Text(frame, height=20, wrap=tk.WORD)
-        self.log.grid(row=19, column=0, columnspan=4, sticky="nsew")
-        frame.rowconfigure(19, weight=1)
+        self.log.grid(row=18, column=0, columnspan=4, sticky="nsew")
+        frame.rowconfigure(18, weight=1)
         frame.columnconfigure(1, weight=1)
 
     def _field(self, parent: ttk.Frame, row: int, label: str, key: str, browse: str | None = None, secret: bool = False) -> None:
@@ -184,10 +188,13 @@ class PeerBayDesktop:
         threading.Thread(target=runner, daemon=True).start()
 
     def _auth_headers(self) -> Dict[str, str]:
-        token = self.vars["token"].get().strip()
-        if not token:
+        username = self.vars["auth_username"].get().strip()
+        password = self.vars["auth_password"].get()
+        if not username or not password:
             return {}
-        return {"Authorization": f"Bearer {token}"}
+        raw = f"{username}:{password}".encode("utf-8")
+        encoded = base64.b64encode(raw).decode("ascii")
+        return {"Authorization": f"Basic {encoded}"}
 
     def _http_json(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = self.vars["server"].get().rstrip("/") + path
@@ -219,12 +226,12 @@ class PeerBayDesktop:
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def _set_token_from_auth(self, data: Dict[str, Any]) -> None:
-        token = str(data.get("read_token", "")).strip()
-        if token:
-            self.vars["token"].set(token)
+    def _set_auth_ok(self, data: Dict[str, Any]) -> None:
+        username = str(data.get("username", "")).strip()
+        if username:
+            self.vars["auth_username"].set(username)
             self.save_config()
-            self._set_status("Token updated from auth response")
+            self._set_status(f"Authenticated as {username}")
 
     def signup(self) -> None:
         username = self.vars["auth_username"].get().strip()
@@ -236,7 +243,7 @@ class PeerBayDesktop:
         self._run_http_async(
             "Signing up...",
             lambda: self._http_json("POST", "/api/signup", {"username": username, "password": password}),
-            self._set_token_from_auth,
+            self._set_auth_ok,
         )
 
     def login(self) -> None:
@@ -248,7 +255,7 @@ class PeerBayDesktop:
         self._run_http_async(
             "Logging in...",
             lambda: self._http_json("POST", "/api/login", {"username": username, "password": password}),
-            self._set_token_from_auth,
+            self._set_auth_ok,
         )
 
     def _fmt_bytes(self, size: Any) -> str:
@@ -351,8 +358,10 @@ class PeerBayDesktop:
             self.vars["server"].get(),
             "--peer-url",
             self.vars["peer_url"].get(),
-            "--token",
-            self.vars["token"].get(),
+            "--username",
+            self.vars["auth_username"].get(),
+            "--password",
+            self.vars["auth_password"].get(),
         ]
         self._run_cmd_async(args, "Publish complete")
 
@@ -370,8 +379,10 @@ class PeerBayDesktop:
             "download",
             "--server",
             self.vars["server"].get(),
-            "--token",
-            self.vars["token"].get(),
+            "--username",
+            self.vars["auth_username"].get(),
+            "--password",
+            self.vars["auth_password"].get(),
             "--cid",
             cid,
             "--dest-dir",
@@ -414,6 +425,40 @@ class PeerBayDesktop:
         self.server_proc.terminate()
         self._set_status("Peer server stopped")
 
+    def start_tunnel(self) -> None:
+        if self.tunnel_proc and self.tunnel_proc.poll() is None:
+            self._set_status("Tunnel already running")
+            return
+        if not shutil.which("cloudflared"):
+            self._set_status("cloudflared not installed. Run: brew install cloudflared")
+            return
+        port = self.vars["port"].get().strip() or "9090"
+        args = ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"]
+        self.tunnel_proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        def tail() -> None:
+            assert self.tunnel_proc is not None
+            if self.tunnel_proc.stdout is None:
+                return
+            for line in self.tunnel_proc.stdout:
+                s = line.rstrip()
+                self.log_queue.put(s)
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", s)
+                if m:
+                    url = m.group(0)
+                    self.root.after(0, lambda u=url: self.vars["peer_url"].set(u))
+                    self.root.after(0, lambda: self.status_var.set("Tunnel started; peer URL auto-filled"))
+
+        threading.Thread(target=tail, daemon=True).start()
+        self._set_status("Starting tunnel...")
+
+    def stop_tunnel(self) -> None:
+        if not self.tunnel_proc or self.tunnel_proc.poll() is not None:
+            self._set_status("Tunnel is not running")
+            return
+        self.tunnel_proc.terminate()
+        self._set_status("Tunnel stopped")
+
 
 def main() -> None:
     if not PEER_SCRIPT.exists():
@@ -423,6 +468,7 @@ def main() -> None:
 
     def on_close() -> None:
         app.stop_server()
+        app.stop_tunnel()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)

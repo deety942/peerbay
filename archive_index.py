@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import binascii
 import datetime as dt
 import hashlib
 import hmac
@@ -940,6 +942,17 @@ def login_user_and_rotate_tokens(conn: sqlite3.Connection, username: str, passwo
     return {"read_token": read_token, "mesh_token": mesh_token}
 
 
+def verify_user_credentials(conn: sqlite3.Connection, username: str, password: str) -> bool:
+    row = conn.execute(
+        "SELECT password_salt, password_hash FROM users WHERE username = ?",
+        (username,),
+    ).fetchone()
+    if not row:
+        return False
+    expected = hash_password(password, row["password_salt"])
+    return hmac.compare_digest(expected, row["password_hash"])
+
+
 def upsert_p2p_source(
     conn: sqlite3.Connection,
     *,
@@ -1646,6 +1659,39 @@ class ArchiveHandler(BaseHTTPRequestHandler):
         token = parse_qs(parsed.query).get("token", [None])[0]
         return token.strip() if isinstance(token, str) else token
 
+    def _basic_credentials(self) -> Optional[tuple[str, str]]:
+        auth = self.headers.get("Authorization", "")
+        if not auth.lower().startswith("basic "):
+            return None
+        raw = auth[6:].strip()
+        if not raw:
+            return None
+        try:
+            decoded = base64.b64decode(raw).decode("utf-8")
+        except (ValueError, binascii.Error, UnicodeDecodeError):
+            return None
+        if ":" not in decoded:
+            return None
+        username, password = decoded.split(":", 1)
+        username = username.strip()
+        if not username:
+            return None
+        return username, password
+
+    def _username_from_basic_auth(self) -> Optional[str]:
+        creds = self._basic_credentials()
+        if not creds:
+            return None
+        username, password = creds
+        conn = ensure_db(self.db_path)
+        try:
+            ok = verify_user_credentials(conn, username, password)
+        finally:
+            conn.close()
+        if not ok:
+            return None
+        return username
+
     def _require_admin(self) -> bool:
         admin_token = self.state.get("admin_token")
         if not admin_token:
@@ -1669,6 +1715,8 @@ class ArchiveHandler(BaseHTTPRequestHandler):
                 conn.close()
             if hit:
                 return True
+        if self._username_from_basic_auth():
+            return True
         if not read_token:
             return True
         self._send_json({"error": "unauthorized"}, status=401)
@@ -1687,12 +1735,17 @@ class ArchiveHandler(BaseHTTPRequestHandler):
                 conn.close()
             if hit:
                 return True
+        if self._username_from_basic_auth():
+            return True
         if not mesh_token:
             return True
         self._send_json({"error": "mesh unauthorized"}, status=401)
         return False
 
     def _resolve_upload_username(self) -> Optional[str]:
+        username = self._username_from_basic_auth()
+        if username:
+            return username
         token = self._token_from_request()
         if not token:
             return None
@@ -1993,15 +2046,13 @@ class ArchiveHandler(BaseHTTPRequestHandler):
                     raise ValueError("password must be at least 10 chars")
                 conn = ensure_db(self.db_path)
                 try:
-                    tokens = create_user(conn, username, password)
+                    create_user(conn, username, password)
                 finally:
                     conn.close()
                 self._send_json(
                     {
                         "ok": True,
                         "username": username,
-                        "read_token": tokens["read_token"],
-                        "mesh_token": tokens["mesh_token"],
                     },
                     status=201,
                 )
@@ -2020,15 +2071,19 @@ class ArchiveHandler(BaseHTTPRequestHandler):
                     raise ValueError("username and password are required")
                 conn = ensure_db(self.db_path)
                 try:
-                    tokens = login_user_and_rotate_tokens(conn, username, password)
+                    row = conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+                    if not row:
+                        raise ValueError("invalid credentials")
+                    if not verify_user_credentials(conn, username, password):
+                        raise ValueError("invalid credentials")
+                    conn.execute("UPDATE users SET last_login_at = ? WHERE username = ?", (utc_now_iso(), username))
+                    conn.commit()
                 finally:
                     conn.close()
                 self._send_json(
                     {
                         "ok": True,
                         "username": username,
-                        "read_token": tokens["read_token"],
-                        "mesh_token": tokens["mesh_token"],
                     }
                 )
             except Exception as exc:
