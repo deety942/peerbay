@@ -75,6 +75,7 @@ python3 archive_index.py --db ./archive_index.db serve \
 - `/api/browse?path=<relative-folder>`
 - `/api/signup`
 - `/api/login`
+- `/api/upload?path=<relative-file-path>` (binary body upload with user read token)
 - `/api/rescan`
 - `/api/peers`
 - `/api/announce`
@@ -89,3 +90,10 @@ python3 archive_index.py --db ./archive_index.db serve \
 4. Set `ARCHIVE_NODE_URL` to your public HTTPS URL.
 5. Set `ARCHIVE_BOOTSTRAP_PEERS` for initial discovery (if multi-node).
 6. Keep shared folder limited to intended public content.
+
+## User self-service flow
+
+1. User signs up in UI (`username` + `password`).
+2. peerBay issues user `read_token` and `mesh_token`.
+3. User `read_token` can browse/download and upload files from browser.
+4. Uploaded files are stored under `/data/share/users/<username>/...`.

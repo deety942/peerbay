@@ -302,6 +302,16 @@ INDEX_HTML = """<!doctype html>
       <hr style="border:0;border-top:1px solid rgba(200,208,214,.25);margin:12px 0;" />
       <div class="panel-grid">
         <div class="field">
+          <label for="uploadInput">Upload Files/Folder</label>
+          <input id="uploadInput" type="file" multiple webkitdirectory directory />
+        </div>
+      </div>
+      <div class="actions">
+        <button id="uploadBtn">Upload Selected</button>
+      </div>
+      <hr style="border:0;border-top:1px solid rgba(200,208,214,.25);margin:12px 0;" />
+      <div class="panel-grid">
+        <div class="field">
           <label for="authUsername">Signup/Login User</label>
           <input id="authUsername" placeholder="newuser" />
         </div>
@@ -349,6 +359,7 @@ INDEX_HTML = """<!doctype html>
     const tokenEl = document.getElementById("accessToken");
     const pathLabelEl = document.getElementById("pathLabel");
     const issuedTokenEl = document.getElementById("issuedToken");
+    const uploadInputEl = document.getElementById("uploadInput");
     let currentBrowsePath = "";
     let currentMode = "browse";
 
@@ -643,6 +654,37 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    async function uploadSelected() {
+      const files = Array.from(uploadInputEl.files || []);
+      if (!files.length) {
+        setStatus("Select files or a folder first.", true);
+        return;
+      }
+      let success = 0;
+      for (let i = 0; i < files.length; i += 1) {
+        const f = files[i];
+        const rel = (f.webkitRelativePath && f.webkitRelativePath.trim()) ? f.webkitRelativePath : f.name;
+        setStatus("Uploading " + (i + 1) + "/" + files.length + ": " + rel);
+        const params = new URLSearchParams({ path: rel });
+        try {
+          const res = await fetch("/api/upload?" + params.toString(), {
+            method: "POST",
+            headers: authHeaders(false),
+            body: f
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Upload failed");
+          success += 1;
+        } catch (err) {
+          setStatus("Upload failed at " + rel + ": " + String(err), true);
+          return;
+        }
+      }
+      setStatus("Uploaded " + success + " file(s).");
+      uploadInputEl.value = "";
+      await loadBrowse(currentBrowsePath);
+    }
+
     document.getElementById("searchBtn").addEventListener("click", () => {
       const q = document.getElementById("searchQuery").value.trim();
       if (!q) {
@@ -667,6 +709,7 @@ INDEX_HTML = """<!doctype html>
     });
     document.getElementById("saveProfileBtn").addEventListener("click", saveProfile);
     document.getElementById("rescanBtn").addEventListener("click", rescanFolder);
+    document.getElementById("uploadBtn").addEventListener("click", uploadSelected);
     document.getElementById("signupBtn").addEventListener("click", signupUser);
     document.getElementById("loginBtn").addEventListener("click", loginUser);
     tokenEl.addEventListener("change", () => {
@@ -1589,6 +1632,21 @@ class ArchiveHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "mesh unauthorized"}, status=401)
         return False
 
+    def _resolve_upload_username(self) -> Optional[str]:
+        token = self._token_from_request()
+        if not token:
+            return None
+        if token == self.state.get("admin_token"):
+            return str(self.state.get("username") or "admin")
+        conn = ensure_db(self.db_path)
+        try:
+            hit = lookup_api_token(conn, token, "read")
+        finally:
+            conn.close()
+        if not hit:
+            return None
+        return str(hit.get("username") or "").strip() or None
+
     def _rate_limited(self, key: str, limit: int, window_seconds: int) -> bool:
         ip = self.client_address[0] if self.client_address else "unknown"
         bucket_key = f"{ip}:{key}"
@@ -1737,6 +1795,76 @@ class ArchiveHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/upload":
+            if self._rate_limited("upload", 120, 60):
+                return
+            shared_dir = self.state.get("shared_dir")
+            if shared_dir is None:
+                self._send_json({"error": "shared folder is not configured"}, status=400)
+                return
+            uploader = self._resolve_upload_username()
+            if not uploader:
+                self._send_json({"error": "unauthorized"}, status=401)
+                return
+            try:
+                query = parse_qs(parsed.query)
+                rel_raw = query.get("path", [""])[0]
+                rel_path = normalize_browse_path(rel_raw)
+                if not rel_path:
+                    raise ValueError("path is required")
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0:
+                    raise ValueError("request body is empty")
+                max_bytes = int(self.state.get("max_upload_bytes", 50 * 1024 * 1024))
+                if length > max_bytes:
+                    self._send_json({"error": "file too large"}, status=413)
+                    return
+
+                base = Path(shared_dir).resolve()
+                user_root = (base / "users" / uploader).resolve()
+                target = (user_root / rel_path).resolve()
+                try:
+                    target.relative_to(user_root)
+                except ValueError:
+                    raise ValueError("invalid upload path")
+                target.parent.mkdir(parents=True, exist_ok=True)
+
+                remaining = length
+                with target.open("wb") as fh:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        remaining -= len(chunk)
+                if remaining != 0:
+                    raise ValueError("incomplete upload body")
+
+                conn = ensure_db(self.db_path)
+                try:
+                    refresh_path_entry(
+                        conn,
+                        path=str(target),
+                        tags=None,
+                        source_node=uploader,
+                        secret=self.secret,
+                        shared_dir=base,
+                    )
+                finally:
+                    conn.close()
+                self._send_json(
+                    {
+                        "ok": True,
+                        "uploader": uploader,
+                        "path": f"users/{uploader}/{rel_path}",
+                        "bytes": length,
+                    },
+                    status=201,
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/signup":
             if not self.state.get("allow_signup"):
                 self._send_json({"error": "signup disabled"}, status=403)
@@ -2046,6 +2174,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         "mesh_token": args.mesh_token,
         "production": bool(args.production),
         "allow_signup": bool(args.allow_signup),
+        "max_upload_bytes": int(max(1, args.max_upload_mb) * 1024 * 1024),
         "rate_limits": {},
     }
 
@@ -2086,6 +2215,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 },
                 "production": bool(args.production),
                 "allow_signup": bool(args.allow_signup),
+                "max_upload_mb": int(max(1, args.max_upload_mb)),
             },
             indent=2,
         )
@@ -2233,6 +2363,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True if os.getenv("ARCHIVE_ALLOW_SIGNUP") is None else is_true_env(os.getenv("ARCHIVE_ALLOW_SIGNUP")),
         help="Allow public self-signup to generate per-user tokens",
+    )
+    serve.add_argument(
+        "--max-upload-mb",
+        type=int,
+        default=int(os.getenv("ARCHIVE_MAX_UPLOAD_MB", "200")),
+        help="Maximum upload size per file in MB",
     )
     serve.set_defaults(func=cmd_serve)
 
