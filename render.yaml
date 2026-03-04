@@ -16,7 +16,7 @@ services:
       - key: ARCHIVE_PRODUCTION
         value: "true"
       - key: ARCHIVE_NODE_URL
-        sync: false
+        value: https://replace-me.onrender.com
       - key: ARCHIVE_INDEX_SECRET
         generateValue: true
       - key: ARCHIVE_ADMIN_TOKEN
